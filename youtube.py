@@ -1,0 +1,138 @@
+import os
+import asyncio
+import aiohttp
+from youtube_search import YoutubeSearch
+
+API_URL = os.environ.get("API_URL", "https://api.shrutibots.site")
+API_KEY = os.environ.get("API_KEY", "")
+
+DOWNLOAD_DIR = "downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+
+async def search_youtube(query: str):
+    """YouTube pe search karta hai, pehla result deta hai (raw dict, library format)."""
+    loop = asyncio.get_event_loop()
+
+    def _search():
+        results = YoutubeSearch(query, max_results=1).to_dict()
+        return results[0] if results else None
+
+    return await loop.run_in_executor(None, _search)
+
+
+async def search_track(query: str):
+    """search_youtube ka normalized wrapper — id/title/duration/thumbnail/url deta hai."""
+    result = await search_youtube(query)
+    if not result:
+        return None
+
+    thumbnails = result.get("thumbnails") or []
+    video_id = result.get("id")
+
+    return {
+        "id": video_id,
+        "title": result.get("title", "Unknown"),
+        "duration": result.get("duration", ""),
+        "channel": result.get("channel", ""),
+        "views": result.get("views", ""),
+        "thumbnail": thumbnails[0] if thumbnails else None,
+        "url": f"https://www.youtube.com/watch?v={video_id}" if video_id else None,
+    }
+
+
+async def search_related_track(seed_title: str, exclude_ids=None):
+    """
+    Autoplay ke liye — pichhle gaane ke title se milta-julta agla gaana
+    dhoondta hai (recent history mein na ho aisa pehla result). Related-video
+    API na hone ki wajah se yeh seed title ko hi query ki tarah use karta hai.
+    """
+    exclude_ids = set(exclude_ids or [])
+    loop = asyncio.get_event_loop()
+
+    def _search():
+        try:
+            return YoutubeSearch(seed_title, max_results=8).to_dict()
+        except Exception:
+            return []
+
+    results = await loop.run_in_executor(None, _search)
+    for r in results:
+        video_id = r.get("id")
+        if not video_id or video_id in exclude_ids:
+            continue
+        thumbnails = r.get("thumbnails") or []
+        return {
+            "id": video_id,
+            "title": r.get("title", "Unknown"),
+            "duration": r.get("duration", ""),
+            "channel": r.get("channel", ""),
+            "views": r.get("views", ""),
+            "thumbnail": thumbnails[0] if thumbnails else None,
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+        }
+    return None
+
+
+async def get_stream_url(video_id: str) -> str:
+    """
+    ShrutiAPI se direct audio stream URL nikalta hai.
+    Koi file download nahi hoti — seedha URL milta hai jo pytgcalls stream karta hai.
+
+    Transient failures (timeout/network hiccup/5xx) par 1 baar retry karta hai,
+    aur fail hone par poora status+body log karta hai — taaki console mein
+    sirf "Exception" na dikhe, balki asli wajah (invalid api key, rate limit,
+    video unavailable, API down, etc) pata chal sake.
+    """
+    last_error = None
+    for attempt in range(2):  # 1 try + 1 retry
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{API_URL}/download",
+                    params={"url": video_id, "type": "audio", "api_key": API_KEY},
+                    timeout=aiohttp.ClientTimeout(total=30),
+                    allow_redirects=False,  # redirect URL chahiye, file nahi
+                ) as resp:
+                    # Agar API direct stream URL redirect kare
+                    if resp.status in (301, 302, 303, 307, 308):
+                        return resp.headers.get("Location")
+
+                    # Agar API JSON mein URL deta hai
+                    if resp.content_type and "json" in resp.content_type:
+                        data = await resp.json()
+                        url = (
+                            data.get("url")
+                            or data.get("download_url")
+                            or data.get("link")
+                            or data.get("audio_url")
+                        )
+                        if url:
+                            return url
+                        raise Exception(
+                            f"API status={resp.status}, JSON mein koi url field nahi mila: {data}"
+                        )
+
+                    # Fallback: agar API seedha file stream karta hai to download karo
+                    if resp.status == 200:
+                        file_path = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
+                        with open(file_path, "wb") as f:
+                            async for chunk in resp.content.iter_chunked(131072):
+                                f.write(chunk)
+                        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                            return file_path
+                        raise Exception("API ne 200 diya lekin file khaali/download nahi hui")
+
+                    # Koi bhi aur status (401/403/404/429/5xx) — body bhi log karo
+                    body_snippet = (await resp.text())[:300]
+                    raise Exception(
+                        f"API ne unexpected response diya: status={resp.status}, body={body_snippet!r}"
+                    )
+        except Exception as e:
+            last_error = e
+            if attempt == 0:
+                await asyncio.sleep(2)  # transient issue ho sakta hai, ek baar retry
+                continue
+            break
+
+    raise last_error
